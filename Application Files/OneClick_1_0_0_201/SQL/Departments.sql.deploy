@@ -1,0 +1,221 @@
+-- ============================================================
+-- DEPARTMENTS + PERMISSIONS
+-- ============================================================
+
+-- 1. Bảng Departments
+IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE name = 'Departments' AND type = 'U')
+BEGIN
+    CREATE TABLE Departments (
+        DepartmentId   UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
+        DepartmentKey  NVARCHAR(100)    NOT NULL UNIQUE,
+        DepartmentName NVARCHAR(200)    NOT NULL,
+        Description    NVARCHAR(500)    NULL,
+        IsActive       BIT              NOT NULL DEFAULT 1,
+        CreatedAt      DATETIME         NOT NULL DEFAULT GETDATE()
+    );
+END
+
+-- 2. UserDepartments – user thuộc department
+IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE name = 'UserDepartments' AND type = 'U')
+BEGIN
+    CREATE TABLE UserDepartments (
+        UserDepartmentId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
+        UserId           UNIQUEIDENTIFIER NOT NULL REFERENCES Users(UserId) ON DELETE CASCADE,
+        DepartmentId     UNIQUEIDENTIFIER NOT NULL REFERENCES Departments(DepartmentId) ON DELETE CASCADE,
+        CONSTRAINT UQ_UserDepartment UNIQUE (UserId, DepartmentId)
+    );
+END
+
+-- 3. DepartmentModules – department được phép truy cập module
+IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE name = 'DepartmentModules' AND type = 'U')
+BEGIN
+    CREATE TABLE DepartmentModules (
+        DepartmentModuleId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
+        DepartmentId       UNIQUEIDENTIFIER NOT NULL REFERENCES Departments(DepartmentId) ON DELETE CASCADE,
+        ModuleId           UNIQUEIDENTIFIER NOT NULL REFERENCES Modules(ModuleId) ON DELETE CASCADE,
+        CONSTRAINT UQ_DepartmentModule UNIQUE (DepartmentId, ModuleId)
+    );
+END
+
+-- 4. DepartmentNotifications – department nhận được loại notification
+IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE name = 'DepartmentNotifications' AND type = 'U')
+BEGIN
+    CREATE TABLE DepartmentNotifications (
+        DepartmentNotificationId UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
+        DepartmentId             UNIQUEIDENTIFIER NOT NULL REFERENCES Departments(DepartmentId) ON DELETE CASCADE,
+        NotificationTypeId       UNIQUEIDENTIFIER NOT NULL REFERENCES NotificationTypes(NotificationTypeId) ON DELETE CASCADE,
+        CONSTRAINT UQ_DeptNotif UNIQUE (DepartmentId, NotificationTypeId)
+    );
+END
+
+GO
+
+-- ============================================================
+-- STORED PROCEDURES
+-- ============================================================
+
+-- usp_GetAllDepartments
+IF OBJECT_ID('usp_GetAllDepartments', 'P') IS NOT NULL DROP PROCEDURE usp_GetAllDepartments;
+GO
+CREATE PROCEDURE usp_GetAllDepartments
+AS
+BEGIN
+    SELECT DepartmentId, DepartmentKey, DepartmentName, Description, IsActive, CreatedAt
+    FROM Departments ORDER BY DepartmentName;
+END
+GO
+
+-- usp_CreateDepartment
+IF OBJECT_ID('usp_CreateDepartment', 'P') IS NOT NULL DROP PROCEDURE usp_CreateDepartment;
+GO
+CREATE PROCEDURE usp_CreateDepartment
+    @DepartmentKey  NVARCHAR(100),
+    @DepartmentName NVARCHAR(200),
+    @Description    NVARCHAR(500) = NULL
+AS
+BEGIN
+    INSERT INTO Departments (DepartmentId, DepartmentKey, DepartmentName, Description)
+    VALUES (NEWID(), @DepartmentKey, @DepartmentName, @Description);
+END
+GO
+
+-- usp_UpdateDepartment
+IF OBJECT_ID('usp_UpdateDepartment', 'P') IS NOT NULL DROP PROCEDURE usp_UpdateDepartment;
+GO
+CREATE PROCEDURE usp_UpdateDepartment
+    @DepartmentId   UNIQUEIDENTIFIER,
+    @DepartmentKey  NVARCHAR(100),
+    @DepartmentName NVARCHAR(200),
+    @Description    NVARCHAR(500) = NULL
+AS
+BEGIN
+    UPDATE Departments
+    SET DepartmentKey = @DepartmentKey, DepartmentName = @DepartmentName, Description = @Description
+    WHERE DepartmentId = @DepartmentId;
+END
+GO
+
+-- usp_DeleteDepartment
+IF OBJECT_ID('usp_DeleteDepartment', 'P') IS NOT NULL DROP PROCEDURE usp_DeleteDepartment;
+GO
+CREATE PROCEDURE usp_DeleteDepartment
+    @DepartmentId UNIQUEIDENTIFIER
+AS
+BEGIN
+    DELETE FROM Departments WHERE DepartmentId = @DepartmentId;
+END
+GO
+
+-- usp_GetDepartmentUsers
+IF OBJECT_ID('usp_GetDepartmentUsers', 'P') IS NOT NULL DROP PROCEDURE usp_GetDepartmentUsers;
+GO
+CREATE PROCEDURE usp_GetDepartmentUsers
+    @DepartmentId UNIQUEIDENTIFIER
+AS
+BEGIN
+    SELECT u.UserId FROM Users u
+    INNER JOIN UserDepartments ud ON ud.UserId = u.UserId
+    WHERE ud.DepartmentId = @DepartmentId;
+END
+GO
+
+-- usp_AssignUserToDepartment
+IF OBJECT_ID('usp_AssignUserToDepartment', 'P') IS NOT NULL DROP PROCEDURE usp_AssignUserToDepartment;
+GO
+CREATE PROCEDURE usp_AssignUserToDepartment
+    @UserId       UNIQUEIDENTIFIER,
+    @DepartmentId UNIQUEIDENTIFIER
+AS
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM UserDepartments WHERE UserId = @UserId AND DepartmentId = @DepartmentId)
+        INSERT INTO UserDepartments (UserId, DepartmentId) VALUES (@UserId, @DepartmentId);
+END
+GO
+
+-- usp_RemoveUserFromDepartment
+IF OBJECT_ID('usp_RemoveUserFromDepartment', 'P') IS NOT NULL DROP PROCEDURE usp_RemoveUserFromDepartment;
+GO
+CREATE PROCEDURE usp_RemoveUserFromDepartment
+    @UserId       UNIQUEIDENTIFIER,
+    @DepartmentId UNIQUEIDENTIFIER
+AS
+BEGIN
+    DELETE FROM UserDepartments WHERE UserId = @UserId AND DepartmentId = @DepartmentId;
+END
+GO
+
+-- usp_GetDepartmentModules
+IF OBJECT_ID('usp_GetDepartmentModules', 'P') IS NOT NULL DROP PROCEDURE usp_GetDepartmentModules;
+GO
+CREATE PROCEDURE usp_GetDepartmentModules
+    @DepartmentId UNIQUEIDENTIFIER
+AS
+BEGIN
+    SELECT m.ModuleId FROM Modules m
+    INNER JOIN DepartmentModules dm ON dm.ModuleId = m.ModuleId
+    WHERE dm.DepartmentId = @DepartmentId;
+END
+GO
+
+-- usp_AssignModuleToDepartment
+IF OBJECT_ID('usp_AssignModuleToDepartment', 'P') IS NOT NULL DROP PROCEDURE usp_AssignModuleToDepartment;
+GO
+CREATE PROCEDURE usp_AssignModuleToDepartment
+    @DepartmentId UNIQUEIDENTIFIER,
+    @ModuleId     UNIQUEIDENTIFIER
+AS
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM DepartmentModules WHERE DepartmentId = @DepartmentId AND ModuleId = @ModuleId)
+        INSERT INTO DepartmentModules (DepartmentId, ModuleId) VALUES (@DepartmentId, @ModuleId);
+END
+GO
+
+-- usp_RemoveModuleFromDepartment
+IF OBJECT_ID('usp_RemoveModuleFromDepartment', 'P') IS NOT NULL DROP PROCEDURE usp_RemoveModuleFromDepartment;
+GO
+CREATE PROCEDURE usp_RemoveModuleFromDepartment
+    @DepartmentId UNIQUEIDENTIFIER,
+    @ModuleId     UNIQUEIDENTIFIER
+AS
+BEGIN
+    DELETE FROM DepartmentModules WHERE DepartmentId = @DepartmentId AND ModuleId = @ModuleId;
+END
+GO
+
+-- usp_GetDepartmentNotifications
+IF OBJECT_ID('usp_GetDepartmentNotifications', 'P') IS NOT NULL DROP PROCEDURE usp_GetDepartmentNotifications;
+GO
+CREATE PROCEDURE usp_GetDepartmentNotifications
+    @DepartmentId UNIQUEIDENTIFIER
+AS
+BEGIN
+    SELECT nt.NotificationTypeId FROM NotificationTypes nt
+    INNER JOIN DepartmentNotifications dn ON dn.NotificationTypeId = nt.NotificationTypeId
+    WHERE dn.DepartmentId = @DepartmentId;
+END
+GO
+
+-- usp_AssignNotificationToDepartment
+IF OBJECT_ID('usp_AssignNotificationToDepartment', 'P') IS NOT NULL DROP PROCEDURE usp_AssignNotificationToDepartment;
+GO
+CREATE PROCEDURE usp_AssignNotificationToDepartment
+    @DepartmentId      UNIQUEIDENTIFIER,
+    @NotificationTypeId UNIQUEIDENTIFIER
+AS
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM DepartmentNotifications WHERE DepartmentId = @DepartmentId AND NotificationTypeId = @NotificationTypeId)
+        INSERT INTO DepartmentNotifications (DepartmentId, NotificationTypeId) VALUES (@DepartmentId, @NotificationTypeId);
+END
+GO
+
+-- usp_RemoveNotificationFromDepartment
+IF OBJECT_ID('usp_RemoveNotificationFromDepartment', 'P') IS NOT NULL DROP PROCEDURE usp_RemoveNotificationFromDepartment;
+GO
+CREATE PROCEDURE usp_RemoveNotificationFromDepartment
+    @DepartmentId      UNIQUEIDENTIFIER,
+    @NotificationTypeId UNIQUEIDENTIFIER
+AS
+BEGIN
+    DELETE FROM DepartmentNotifications WHERE DepartmentId = @DepartmentId AND NotificationTypeId = @NotificationTypeId;
+END
+GO
