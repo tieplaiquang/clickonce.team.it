@@ -1,0 +1,119 @@
+-- =============================================
+-- Notification Permissions Schema
+-- =============================================
+
+-- 1. Bảng lưu các loại notification
+IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'NotificationTypes')
+BEGIN
+    CREATE TABLE [dbo].[NotificationTypes] (
+        [NotificationTypeId] UNIQUEIDENTIFIER    NOT NULL DEFAULT NEWID() PRIMARY KEY,
+        [NotificationKey]    NVARCHAR(100)       NOT NULL UNIQUE,
+        [Name]               NVARCHAR(255)       NOT NULL,
+        [Description]        NVARCHAR(MAX)       NULL,
+        [IsActive]           BIT                 NOT NULL DEFAULT 1,
+        [CreatedAt]          DATETIME            NOT NULL DEFAULT GETDATE()
+    );
+END
+
+-- 2. Bảng lưu quyền nhận notification của từng User
+IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'UserNotificationPermissions')
+BEGIN
+    CREATE TABLE [dbo].[UserNotificationPermissions] (
+        [PermissionId]       UNIQUEIDENTIFIER    NOT NULL DEFAULT NEWID() PRIMARY KEY,
+        [UserId]             UNIQUEIDENTIFIER    NOT NULL,
+        [NotificationTypeId] UNIQUEIDENTIFIER    NOT NULL,
+        [CreatedAt]          DATETIME            NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT [FK_UserNotif_User]     FOREIGN KEY ([UserId])             REFERENCES [dbo].[Users]([UserId])             ON DELETE CASCADE,
+        CONSTRAINT [FK_UserNotif_Type]     FOREIGN KEY ([NotificationTypeId]) REFERENCES [dbo].[NotificationTypes]([NotificationTypeId]) ON DELETE CASCADE,
+        CONSTRAINT [UQ_UserNotif]          UNIQUE ([UserId], [NotificationTypeId])
+    );
+END
+
+-- 3. Insert 9 notification types tương ứng với NotificationService.cs
+IF NOT EXISTS (SELECT 1 FROM [dbo].[NotificationTypes])
+BEGIN
+    INSERT INTO [dbo].[NotificationTypes] ([NotificationKey], [Name], [Description]) VALUES
+    ('Negative',          N'Záporné množství',                          N'Upozornění na negativní skladové množství'),
+    ('MissingReceipt',    N'Chybí doklad došlý',                        N'Chybějící doklady příjmu zboží'),
+    ('LowMargin',         N'Produkty s marží pod 30%',                  N'Produkty s nízkým ziskovým maržáním'),
+    ('ProductWarning',    N'Neúplné produktové záznamy',                N'Produkty chybí v e-shopu nebo nemají obrázek'),
+    ('MasterData',        N'Chybějící master data',                     N'Produkty bez vyplněných hlavních údajů'),
+    ('ProductMissing',    N'RP - Chybějící příslušenství a hmotnost',  N'Chybí informace o příslušenství a hmotnosti'),
+    ('RecyclingReport',   N'RP - Výkaz',                                N'Povinné hlášení výkazů recyklace'),
+    ('OrderTracking',     N'Objednávky od obchodní zástupce',           N'Nové objednávky od obchodních zástupců'),
+    ('Unsold',            N'Neprodejné zboží',                          N'Zboží bez prodeje po dobu 3 měsíců');
+END
+
+-- 4. Stored Procedures
+
+-- Lấy tất cả notification types
+IF OBJECT_ID('dbo.usp_GetAllNotificationTypes', 'P') IS NOT NULL
+    DROP PROCEDURE [dbo].[usp_GetAllNotificationTypes];
+GO
+CREATE PROCEDURE [dbo].[usp_GetAllNotificationTypes]
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT [NotificationTypeId], [NotificationKey], [Name], [Description], [IsActive]
+    FROM   [dbo].[NotificationTypes]
+    WHERE  [IsActive] = 1
+    ORDER BY [Name];
+END
+GO
+
+-- Lấy các notification types mà user được phép nhận
+IF OBJECT_ID('dbo.usp_GetUserNotificationPermissions', 'P') IS NOT NULL
+    DROP PROCEDURE [dbo].[usp_GetUserNotificationPermissions];
+GO
+CREATE PROCEDURE [dbo].[usp_GetUserNotificationPermissions]
+    @UserId UNIQUEIDENTIFIER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT nt.[NotificationTypeId], nt.[NotificationKey], nt.[Name], nt.[Description]
+    FROM   [dbo].[NotificationTypes] nt
+    INNER JOIN [dbo].[UserNotificationPermissions] unp
+           ON nt.[NotificationTypeId] = unp.[NotificationTypeId]
+    WHERE  unp.[UserId] = @UserId
+    AND    nt.[IsActive] = 1;
+END
+GO
+
+-- Gán quyền notification cho user
+IF OBJECT_ID('dbo.usp_AssignNotificationToUser', 'P') IS NOT NULL
+    DROP PROCEDURE [dbo].[usp_AssignNotificationToUser];
+GO
+CREATE PROCEDURE [dbo].[usp_AssignNotificationToUser]
+    @UserId             UNIQUEIDENTIFIER,
+    @NotificationTypeId UNIQUEIDENTIFIER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF NOT EXISTS (
+        SELECT 1 FROM [dbo].[UserNotificationPermissions]
+        WHERE [UserId] = @UserId AND [NotificationTypeId] = @NotificationTypeId
+    )
+    BEGIN
+        INSERT INTO [dbo].[UserNotificationPermissions] ([UserId], [NotificationTypeId])
+        VALUES (@UserId, @NotificationTypeId);
+    END
+END
+GO
+
+-- Thu hồi quyền notification của user
+IF OBJECT_ID('dbo.usp_RemoveNotificationFromUser', 'P') IS NOT NULL
+    DROP PROCEDURE [dbo].[usp_RemoveNotificationFromUser];
+GO
+CREATE PROCEDURE [dbo].[usp_RemoveNotificationFromUser]
+    @UserId             UNIQUEIDENTIFIER,
+    @NotificationTypeId UNIQUEIDENTIFIER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DELETE FROM [dbo].[UserNotificationPermissions]
+    WHERE [UserId] = @UserId AND [NotificationTypeId] = @NotificationTypeId;
+END
+GO
+
+-- Verify
+SELECT [NotificationKey], [Name] FROM [dbo].[NotificationTypes] ORDER BY [Name];
