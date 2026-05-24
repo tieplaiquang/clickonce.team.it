@@ -1,0 +1,53 @@
+-- =============================================
+-- FixRoleModules.sql
+-- Xóa toàn bộ RoleModules vì module được phân theo Department, không theo Role.
+-- Cập nhật usp_GetUserModules để chỉ lấy via Department và Direct User.
+-- =============================================
+
+-- 1. Xóa toàn bộ dữ liệu trong RoleModules
+IF OBJECT_ID('dbo.RoleModules', 'U') IS NOT NULL
+BEGIN
+	DELETE FROM dbo.RoleModules;
+	PRINT 'RoleModules: đã xóa toàn bộ bản ghi.';
+END
+ELSE
+BEGIN
+	PRINT 'RoleModules: table không tồn tại, bỏ qua.';
+END
+GO
+
+-- 2. Cập nhật usp_GetUserModules: chỉ via Department và Direct (không via Role), trừ deny
+IF OBJECT_ID('dbo.usp_GetUserModules', 'P') IS NOT NULL
+	DROP PROCEDURE dbo.usp_GetUserModules;
+GO
+CREATE PROCEDURE dbo.usp_GetUserModules
+	@UserId UNIQUEIDENTIFIER
+AS
+BEGIN
+	SET NOCOUNT ON;
+	SELECT DISTINCT m.ModuleId, m.ModuleKey, m.ModuleName
+	FROM dbo.Modules m
+	WHERE m.IsActive = 1
+	  AND (
+		  -- via Department
+		  EXISTS (
+			  SELECT 1 FROM dbo.DepartmentModules dm
+			  INNER JOIN dbo.UserDepartments ud ON ud.DepartmentId = dm.DepartmentId
+			  WHERE ud.UserId = @UserId AND dm.ModuleId = m.ModuleId
+		  )
+		  OR
+		  -- direct (cấp trực tiếp cho user, ví dụ Super admin / Admin)
+		  EXISTS (
+			  SELECT 1 FROM dbo.UserModules um
+			  WHERE um.UserId = @UserId AND um.ModuleId = m.ModuleId
+		  )
+	  )
+	  -- loại trừ những module bị deny cho user này
+	  AND NOT EXISTS (
+		  SELECT 1 FROM dbo.UserModuleDenies umd
+		  WHERE umd.UserId = @UserId AND umd.ModuleId = m.ModuleId
+	  );
+END
+GO
+
+PRINT 'usp_GetUserModules đã được cập nhật: chỉ via Department và Direct.';
