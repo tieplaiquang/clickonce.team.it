@@ -1,0 +1,150 @@
+ALTER FUNCTION [dbo].[fn_GetRevenueClosing]
+(
+	@From DATE = NULL,
+	@To   DATE = NULL
+)
+RETURNS TABLE
+AS
+RETURN
+(
+	WITH Params AS (
+		SELECT 
+			DateFrom = COALESCE(@From, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)),
+			DateTo   = COALESCE(@To,   CAST(GETDATE() AS DATE))
+	),
+	Calendar AS (
+		SELECT P.DateFrom AS [Date]
+		FROM Params P
+		UNION ALL 
+		SELECT DATEADD(DAY, 1, C.[Date]) 
+		FROM Calendar C
+		CROSS JOIN Params P
+		WHERE C.[Date] < P.DateTo
+	),
+	CashFVByDay AS (
+		SELECT 
+			[Date],
+			SUM(SumaCashFV)       AS SumaCashFV,
+			SUM(SumaRefundCashFV) AS SumaRefundCashFV
+		FROM (
+			SELECT 
+				FV.DatumVystaveni AS [Date], 
+				SUM(CASE WHEN FV.ZapornyPohyb = 0 THEN U.CastkaHrazenaDM ELSE 0 END) AS SumaCashFV,
+				SUM(CASE WHEN FV.ZapornyPohyb = 1 THEN U.CastkaHrazenaDM ELSE 0 END) AS SumaRefundCashFV
+			FROM [S5_Agenda_001_20190131130454].[dbo].[Fakturace_FakturaVydana] FV WITH (NOLOCK)
+			JOIN [S5_Agenda_001_20190131130454].[dbo].[Ciselniky_ZpusobPlatby] Z WITH (NOLOCK)
+				ON Z.ID = FV.ZpusobPlatby_ID AND Z.Deleted = 0 AND Z.Nazev = N'Hotově'
+			JOIN [S5_Agenda_001_20190131130454].[dbo].[Saldo_Uhrada] U WITH (NOLOCK)
+				ON U.ZdrojovyDoklad_ID = FV.ID AND U.Deleted = 0
+			CROSS JOIN Params P
+			WHERE FV.Deleted = 0 
+			  AND FV.DatumVystaveni BETWEEN P.DateFrom AND P.DateTo
+			  AND FV.System_Priznak != 5 
+			GROUP BY FV.DatumVystaveni
+		) AS t
+		GROUP BY [Date]
+	),
+	CashDLVByDay AS (
+		SELECT 
+			DV.DatumVystaveni AS [Date], 
+			SumaCashDLV       = SUM(CASE WHEN DV.ZapornyPohyb = 0 THEN DV.SumaCelkem ELSE 0 END),
+			SumaRefundCashDLV = SUM(CASE WHEN DV.ZapornyPohyb = 1 THEN DV.SumaCelkem ELSE 0 END)
+		FROM [S5_Agenda_001_20190131130454].[dbo].[SkladovyDoklad_DodaciListVydany] DV WITH (NOLOCK)
+		CROSS JOIN Params P
+		WHERE DV.Deleted = 0 
+		  AND DV.System_Priznak = 1 
+		  AND DV.DatumVystaveni BETWEEN P.DateFrom AND P.DateTo
+		GROUP BY DV.DatumVystaveni
+	),
+	RevenueCashPerDay AS (
+		SELECT 
+			C.[Date], 
+			Cash = CAST(
+				COALESCE(FV.SumaCashFV,       0) - COALESCE(FV.SumaRefundCashFV,    0) + 
+				COALESCE(DL.SumaCashDLV,      0) - COALESCE(DL.SumaRefundCashDLV,   0)
+				AS DECIMAL(18,2)
+			)
+		FROM Calendar C
+		LEFT JOIN CashFVByDay  FV ON FV.[Date] = C.[Date]
+		LEFT JOIN CashDLVByDay DL ON DL.[Date] = C.[Date]
+	),
+	LastAlbaconPerDay AS (
+		SELECT
+			Closing_Date AS [Date],
+			LastAlbacon  = ISNULL(Albacon, 0)
+		FROM (
+			SELECT
+				Closing_Date,
+				Albacon,
+				ROW_NUMBER() OVER (PARTITION BY Closing_Date ORDER BY Closing_Run DESC) AS rn
+			FROM [OCS].[dbo].[DailyClosing] WITH (NOLOCK)
+			CROSS JOIN Params P
+			WHERE Closing_Date BETWEEN P.DateFrom AND P.DateTo
+		) X
+		WHERE rn = 1
+	),
+	DailyClosingPerDay AS (
+		SELECT
+			DC.Closing_Date AS [Date],
+			-- Tong tien mat duoc kiem theo cong thuc cu
+			DailyClosingTotalCash = CAST(ROUND(
+				SUM(
+					ISNULL(DC.Cash_CZK, 0) +
+					ISNULL(DC.Coins,    0) +
+					CASE WHEN ISNULL(DC.Cash_EUR, 0) > 0 AND ISNULL(DC.Rate_EUR, 0) > 0
+						 THEN DC.Cash_EUR * DC.Rate_EUR ELSE 0 END +
+					CASE WHEN ISNULL(DC.Cash_USD, 0) > 0 AND ISNULL(DC.Rate_USD, 0) > 0
+						 THEN DC.Cash_USD * DC.Rate_USD ELSE 0 END
+				)
+				-- Dieu chinh theo Balance:
+				--   Neu closing truoc Is_Manual_Balance = 1 (nhap tay):
+				--       khong cong, khong tru balance (giu nguyen)
+				--   Neu closing truoc Is_Manual_Balance = 0 (tu dong carry-over):
+				--       cong Balance truoc, tru Balance hien tai
+				+ CASE
+					WHEN PrevDC.Is_Manual_Balance = 1
+						THEN 0
+					ELSE
+						ISNULL(PrevDC.Balance, 0) - LastRun.Balance
+				  END
+			, 2) AS DECIMAL(18,2))
+		FROM [OCS].[dbo].[DailyClosing] DC WITH (NOLOCK)
+		CROSS JOIN Params P
+		-- Balance cua run cuoi cung trong ngay hien tai
+		CROSS APPLY (
+			SELECT TOP 1 LR.Balance
+			FROM [OCS].[dbo].[DailyClosing] LR WITH (NOLOCK)
+			WHERE LR.Closing_Date = DC.Closing_Date
+			ORDER BY LR.Closing_Run DESC
+		) LastRun
+		-- Closing gan nhat truoc ngay hien tai (run cuoi cua ngay do)
+		OUTER APPLY (
+			SELECT TOP 1 Prev.Is_Manual_Balance, Prev.Balance
+			FROM [OCS].[dbo].[DailyClosing] Prev WITH (NOLOCK)
+			WHERE Prev.Closing_Date < DC.Closing_Date
+			ORDER BY Prev.Closing_Date DESC, Prev.Closing_Run DESC
+		) PrevDC
+		WHERE DC.Closing_Date BETWEEN P.DateFrom AND P.DateTo
+		GROUP BY DC.Closing_Date, PrevDC.Is_Manual_Balance, PrevDC.Balance, LastRun.Balance
+	)
+	SELECT
+		C.[Date],
+		RevenueTotalCash      = ISNULL(R.Cash, 0),
+		DailyClosingTotalCash = ISNULL(DC.DailyClosingTotalCash, 0) + ISNULL(LA.LastAlbacon, 0),
+		DifferenceCash        = (ISNULL(DC.DailyClosingTotalCash, 0) + ISNULL(LA.LastAlbacon, 0)) - ISNULL(R.Cash, 0),
+		PercentDifference     = CAST(
+			CASE 
+				WHEN ISNULL(R.Cash, 0) = 0 THEN NULL
+				ELSE
+				(
+					((ISNULL(DC.DailyClosingTotalCash, 0) + ISNULL(LA.LastAlbacon, 0)) - ISNULL(R.Cash, 0))
+					/ NULLIF(ISNULL(R.Cash, 0), 0)
+					* 100.0
+				)
+			END
+		AS DECIMAL(9,2))
+	FROM Calendar C
+	LEFT JOIN RevenueCashPerDay  R  ON R.[Date]  = C.[Date]
+	LEFT JOIN DailyClosingPerDay DC ON DC.[Date] = C.[Date]
+	LEFT JOIN LastAlbaconPerDay  LA ON LA.[Date] = C.[Date]
+);
