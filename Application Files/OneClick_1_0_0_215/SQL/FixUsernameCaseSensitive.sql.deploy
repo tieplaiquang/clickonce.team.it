@@ -1,0 +1,25 @@
+-- =============================================
+-- FixUsernameCaseSensitive.sql
+-- Sửa usp_GetUserByUsername để so sánh Username case-sensitive.
+-- 'manh' và 'Manh' sẽ được coi là hai user khác nhau.
+-- Chạy script này trong SQL Server Management Studio.
+-- =============================================
+
+IF OBJECT_ID('dbo.usp_GetUserByUsername', 'P') IS NOT NULL
+	DROP PROCEDURE dbo.usp_GetUserByUsername;
+GO
+CREATE PROCEDURE [dbo].[usp_GetUserByUsername]
+	@Username NVARCHAR(100)
+AS
+BEGIN
+	SET NOCOUNT ON;
+	SELECT [UserId], [Username], [PasswordHash], [FullName], [Email], [IsActive],
+		   ISNULL([MustChangePassword], 0) AS [MustChangePassword]
+	FROM   [dbo].[Users]
+	-- COLLATE Latin1_General_CS_AS: CS = Case Sensitive, AS = Accent Sensitive
+	WHERE  [Username] COLLATE Latin1_General_CS_AS = @Username COLLATE Latin1_General_CS_AS
+	  AND  [IsActive] = 1;
+END;
+GO
+
+PRINT 'usp_GetUserByUsername: updated to case-sensitive and accent-sensitive username match.';
