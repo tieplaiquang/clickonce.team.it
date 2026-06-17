@@ -1,0 +1,50 @@
+CREATE PROCEDURE dbo.usp_GetDeliveryScheduleDetails
+	@CisloDokladu NVARCHAR(100) = NULL
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	WITH PolozkaObjednavkyVydane AS (
+		SELECT
+			POV.Poradi,
+			POV.Nazev,
+			POV.Katalog,
+			A.CarovyKod,
+			POV.Mnozstvi,
+			POV.Jednotka,
+			POV.JednCena,
+			A.Zkratka20 AS VN
+		FROM
+			[S5_Agenda_001_20190131130454].[dbo].[Objednavky_PolozkaObjednavkyVydane] POV WITH (NOLOCK)
+		JOIN
+			[S5_Agenda_001_20190131130454].[dbo].[Objednavky_ObjednavkaVydana] OV WITH (NOLOCK)
+			ON POV.Parent_ID = OV.ID
+		JOIN
+			[S5_Agenda_001_20190131130454].[dbo].[Obchod_ObsahPolozkySArtiklem] OPA WITH (NOLOCK)
+			ON POV.ObsahPolozky_ID = OPA.ID
+			AND OPA.Deleted = 0
+		JOIN
+			[S5_Agenda_001_20190131130454].[dbo].[Artikly_Artikl] A WITH (NOLOCK)
+			ON OPA.Artikl_ID = A.ID
+			AND A.Deleted = 0
+		WHERE
+			OV.Deleted = 0
+			AND OV.PriznakVyrizeno = 0
+			AND POV.Deleted = 0
+			AND POV.PriznakVyrizeno = 0
+			AND (@CisloDokladu IS NULL OR OV.CisloDokladu = @CisloDokladu)
+	)
+	SELECT
+		Nazev,
+		Katalog,
+		CarovyKod,
+		Mnozstvi,
+		Jednotka,
+		JednCena,
+		VN
+	FROM
+		PolozkaObjednavkyVydane
+	ORDER BY
+		Poradi;
+END
+GO
