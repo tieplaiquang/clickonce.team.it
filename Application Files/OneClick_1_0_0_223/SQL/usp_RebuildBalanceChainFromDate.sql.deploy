@@ -1,0 +1,178 @@
+IF OBJECT_ID('dbo.usp_RebuildBalanceChainFromDate', 'P') IS NOT NULL
+	DROP PROCEDURE dbo.usp_RebuildBalanceChainFromDate;
+GO
+
+SET QUOTED_IDENTIFIER ON;
+GO
+
+CREATE PROCEDURE [dbo].[usp_RebuildBalanceChainFromDate]
+	@From_Date DATE
+AS
+BEGIN
+	SET NOCOUNT ON;
+	SET XACT_ABORT ON;
+
+	IF @From_Date IS NULL
+	BEGIN
+		RAISERROR(N'From_Date je povinný.', 16, 1);
+		RETURN;
+	END;
+
+	DECLARE
+		@ClosingId BIGINT,
+		@ClosingDate DATE,
+		@ClosingRun INT,
+		@CashCZK DECIMAL(18,2),
+		@CashEUR DECIMAL(18,2),
+		@CashUSD DECIMAL(18,2),
+		@RateEUR DECIMAL(18,6),
+		@RateUSD DECIMAL(18,6),
+		@Coins DECIMAL(18,2),
+		@IsManual BIT,
+		@ManualBal DECIMAL(18,2),
+		@PrevRemain DECIMAL(18,2),
+		@PrevRemEUR DECIMAL(18,2),
+		@PrevRemUSD DECIMAL(18,2),
+		@PrevDate DATE,
+		@NewBalance DECIMAL(18,2),
+		@NewBalEUR DECIMAL(18,2),
+		@NewBalUSD DECIMAL(18,2),
+		@VaultCZK DECIMAL(18,2),
+		@VaultEUR DECIMAL(18,2),
+		@VaultUSD DECIMAL(18,2);
+
+	-- Seed from the last row before the affected date range.
+	SELECT TOP 1
+		@PrevRemain = dc.Remaining,
+		@PrevRemEUR = dc.Remaining_EUR,
+		@PrevRemUSD = dc.Remaining_USD,
+		@PrevDate = dc.Closing_Date
+	FROM dbo.DailyClosing dc WITH (NOLOCK)
+	WHERE dc.Closing_Date < @From_Date
+	ORDER BY dc.Closing_Date DESC, dc.Closing_Run DESC, dc.Closing_Time DESC;
+
+	-- If there is no previous row, keep the chain based on the first affected row itself.
+	IF @PrevRemain IS NULL
+	BEGIN
+		SET @PrevRemain = 0;
+		SET @PrevRemEUR = 0;
+		SET @PrevRemUSD = 0;
+		SET @PrevDate = NULL;
+	END;
+
+	DECLARE FixCursor CURSOR LOCAL FAST_FORWARD FOR
+		SELECT
+			dc.Closing_Id,
+			dc.Closing_Date,
+			dc.Closing_Run,
+			dc.Cash_CZK,
+			dc.Cash_EUR,
+			dc.Cash_USD,
+			dc.Rate_EUR,
+			dc.Rate_USD,
+			dc.Coins,
+			dc.Is_Manual_Balance,
+			dc.Balance
+		FROM dbo.DailyClosing dc
+		WHERE dc.Closing_Date >= @From_Date
+		ORDER BY dc.Closing_Date ASC, dc.Closing_Run ASC, dc.Closing_Time ASC;
+
+	OPEN FixCursor;
+	FETCH NEXT FROM FixCursor INTO
+		@ClosingId, @ClosingDate, @ClosingRun,
+		@CashCZK, @CashEUR, @CashUSD,
+		@RateEUR, @RateUSD, @Coins,
+		@IsManual, @ManualBal;
+
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		IF @PrevDate IS NULL OR @ClosingDate = @PrevDate
+		BEGIN
+			-- First row in range or same-day subsequent run.
+			IF @PrevDate IS NULL
+			BEGIN
+				SET @NewBalance = @ManualBal;
+				SET @NewBalEUR = 0;
+				SET @NewBalUSD = 0;
+			END
+			ELSE
+			BEGIN
+				SET @NewBalance = @PrevRemain;
+				SET @NewBalEUR = @PrevRemEUR;
+				SET @NewBalUSD = @PrevRemUSD;
+			END
+		END
+		ELSE
+		BEGIN
+			SELECT
+				@VaultCZK = ISNULL(SUM(vt.Amount_CZK), 0),
+				@VaultEUR = ISNULL(SUM(vt.Amount_EUR), 0),
+				@VaultUSD = ISNULL(SUM(vt.Amount_USD), 0)
+			FROM dbo.VaultTransfer vt
+			WHERE vt.Closing_Date = @PrevDate
+			  AND vt.Source = N'Pokladna'
+			  AND vt.Direction = N'In';
+
+			IF @IsManual = 1
+				SET @NewBalance = @ManualBal;
+			ELSE
+				SET @NewBalance = @PrevRemain - @VaultCZK;
+
+			SET @NewBalEUR = @PrevRemEUR - @VaultEUR;
+			SET @NewBalUSD = @PrevRemUSD - @VaultUSD;
+		END;
+
+		DECLARE @NewRemain DECIMAL(18,2) = ROUND(@CashCZK + @Coins + @NewBalance, 2);
+		DECLARE @NewRemEUR DECIMAL(18,2) = ROUND(@NewBalEUR + ISNULL(@CashEUR, 0), 2);
+		DECLARE @NewRemUSD DECIMAL(18,2) = ROUND(@NewBalUSD + ISNULL(@CashUSD, 0), 2);
+
+		UPDATE dbo.DailyClosing
+		SET
+			Balance = @NewBalance,
+			Balance_EUR = @NewBalEUR,
+			Balance_USD = @NewBalUSD,
+			Remaining = @NewRemain,
+			Remaining_EUR = @NewRemEUR,
+			Remaining_USD = @NewRemUSD
+		WHERE Closing_Id = @ClosingId;
+
+		SET @PrevDate = @ClosingDate;
+		SET @PrevRemain = @NewRemain;
+		SET @PrevRemEUR = @NewRemEUR;
+		SET @PrevRemUSD = @NewRemUSD;
+
+		FETCH NEXT FROM FixCursor INTO
+			@ClosingId, @ClosingDate, @ClosingRun,
+			@CashCZK, @CashEUR, @CashUSD,
+			@RateEUR, @RateUSD, @Coins,
+			@IsManual, @ManualBal;
+	END;
+
+	CLOSE FixCursor;
+	DEALLOCATE FixCursor;
+
+	BEGIN TRY
+		DECLARE @To_Date DATE = (SELECT MAX(Closing_Date) FROM dbo.DailyClosing);
+		EXEC dbo.usp_PopulateDailyClosingControl
+			@From = @From_Date,
+			@To = @To_Date;
+	END TRY
+	BEGIN CATCH
+		PRINT N'Warning: usp_PopulateDailyClosingControl failed for rebuild starting ' + CONVERT(NVARCHAR(10), @From_Date);
+	END CATCH;
+
+	SELECT
+		Closing_Id,
+		Closing_Date,
+		Closing_Run,
+		Balance,
+		Remaining,
+		Balance_EUR,
+		Remaining_EUR,
+		Balance_USD,
+		Remaining_USD
+	FROM dbo.DailyClosing
+	WHERE Closing_Date >= @From_Date
+	ORDER BY Closing_Date ASC, Closing_Run ASC;
+END;
+GO
