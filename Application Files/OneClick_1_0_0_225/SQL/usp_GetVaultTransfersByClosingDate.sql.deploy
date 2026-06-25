@@ -1,0 +1,52 @@
+-- ============================================================
+-- Stored Procedure: usp_GetVaultTransfersByClosingDate
+-- Database:         OCS
+-- Description:      Vrátí seznam VaultTransfer záznamů pro daný Closing_Date.
+--                   Používá se v edit dialogu uzávěrky pro zobrazení převodů
+--                   do trezoru přiřazených k danému dni.
+-- ============================================================
+
+IF EXISTS (SELECT 1 FROM sys.procedures WHERE name = 'usp_GetVaultTransfersByClosingDate')
+	DROP PROCEDURE [dbo].[usp_GetVaultTransfersByClosingDate];
+GO
+
+SET QUOTED_IDENTIFIER ON;
+GO
+
+CREATE PROCEDURE [dbo].[usp_GetVaultTransfersByClosingDate]
+	@Closing_Date DATE
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	IF @Closing_Date IS NULL
+	BEGIN
+		RAISERROR(N'Closing_Date je povinný.', 16, 1);
+		RETURN;
+	END;
+
+	SELECT
+		VT.Transfer_Id,
+		VT.Closing_Id,
+		VT.Closing_Date,
+		VT.Transfer_Time,
+		VT.Source,
+		VT.Amount_CZK,
+		VT.Amount_EUR,
+		VT.Amount_USD,
+		VT.Rate_EUR,
+		VT.Rate_USD,
+		ISNULL(VT.Amount_Total_CZK, 0) AS Amount_Total_CZK,
+		VT.Direction,
+		VT.Note,
+		VT.Calculated_In_Closing_Id,
+		DC.Closing_Run
+	FROM [dbo].[VaultTransfer] VT
+	LEFT JOIN [dbo].[DailyClosing] DC WITH (NOLOCK)
+		ON DC.Closing_Id = VT.Closing_Id
+	WHERE VT.Closing_Date = @Closing_Date
+	  AND VT.Source = N'Pokladna'
+	  AND VT.Direction = 'In'
+	ORDER BY VT.Transfer_Time ASC;
+END;
+GO
