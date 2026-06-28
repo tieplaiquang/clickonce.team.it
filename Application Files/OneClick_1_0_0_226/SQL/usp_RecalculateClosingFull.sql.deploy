@@ -1,0 +1,248 @@
+IF OBJECT_ID('dbo.usp_RecalculateClosingFull', 'P') IS NOT NULL
+	DROP PROCEDURE dbo.usp_RecalculateClosingFull;
+GO
+
+CREATE PROCEDURE [dbo].[usp_RecalculateClosingFull]
+	@Closing_Date DATE
+AS
+BEGIN
+	SET NOCOUNT ON;
+	SET XACT_ABORT ON;
+
+	IF @Closing_Date IS NULL
+	BEGIN
+		RAISERROR('Parameter @Closing_Date is required.', 16, 1);
+		RETURN;
+	END
+
+	-- =========================================================
+	-- STEP 1: Xoa cac Debt record bi sai:
+	--   - Income_Date = @Closing_Date
+	--   - Status = 0 (chua duoc xu ly)
+	--   - Payment_Status = 'Zaplaceno' (do SP DailyClosingSaveAll tao)
+	--   - PD tuong ung da duoc danh dau Priznak = 5 (tuc la da duoc sua lai)
+	--     => xac dinh bang cach: Debt.ICO hoac Debt.NadrazenaFirma
+	--        KHONG CON xuat hien trong tap PokladniDoklad voi Priznak <> 5 cho ngay do
+	-- =========================================================
+
+	-- Collect Debt_Id can xoa vao bien tam
+	DECLARE @StaleDebtIds TABLE (Debt_Id BIGINT PRIMARY KEY);
+
+	INSERT INTO @StaleDebtIds (Debt_Id)
+	SELECT D.Debt_Id
+	FROM [OCS].[dbo].[Debt] D
+	WHERE D.Income_Date = @Closing_Date
+	  AND D.Status = 0
+	  AND D.Payment_Status = N'Zaplaceno'
+	  AND NOT EXISTS (
+		  -- Kiem tra xem con PD nao hop le (Priznak <> 5) cho cong ty nay khong
+		  SELECT 1
+		  FROM [S5_Agenda_001_20190131130454].[dbo].[Finance_PokladniDoklad] PD WITH (NOLOCK)
+		  OUTER APPLY (
+			  SELECT TOP 1 AK.Nazev
+			  FROM [S5_Agenda_001_20190131130454].[dbo].[Adresar_Firma] F WITH (NOLOCK)
+			  JOIN [S5_Agenda_001_20190131130454].[dbo].[Adresar_FirmaAdresniKlic] FAK WITH (NOLOCK)
+				  ON F.ID = FAK.Parent_ID AND FAK.Deleted = 0
+			  JOIN [S5_Agenda_001_20190131130454].[dbo].[Adresar_AdresniKlic] AK WITH (NOLOCK)
+				  ON FAK.AdresniKlic_ID = AK.ID AND AK.Deleted = 0
+			  WHERE F.ICO = PD.IC AND F.Deleted = 0 AND AK.Kod LIKE N'SKU-%'
+			  ORDER BY AK.Nazev ASC
+		  ) SKU_Kod
+		  CROSS APPLY (
+			  SELECT TOP (1) FV.DatumVystaveni
+			  FROM [S5_Agenda_001_20190131130454].[dbo].[Saldo_Uhrada] U WITH (NOLOCK)
+			  JOIN [S5_Agenda_001_20190131130454].[dbo].[Fakturace_FakturaVydana] FV WITH (NOLOCK)
+				  ON U.ZdrojovyDoklad_ID = FV.ID AND FV.Deleted = 0
+			  WHERE U.CilovyDoklad_ID = PD.ID AND U.Deleted = 0
+			  ORDER BY FV.DatumVystaveni DESC
+		  ) M
+		  WHERE PD.TypDokladu = 1
+			AND PD.Deleted = 0
+			AND PD.System_Priznak <> 5
+			AND PD.DatumPlatby > M.DatumVystaveni
+			AND CONVERT(DATE, PD.DatumPlatby) = @Closing_Date
+			AND (
+				(D.NadrazenaFirma IS NOT NULL AND SKU_Kod.Nazev = D.NadrazenaFirma)
+				OR (D.NadrazenaFirma IS NULL AND SKU_Kod.Nazev IS NULL AND PD.IC = D.ICO)
+			)
+	  );
+
+	-- Xoa child records trong DebtPaymentDetails truoc (FK constraint)
+	DELETE DPD
+	FROM [OCS].[dbo].[DebtPaymentDetails] DPD
+	JOIN @StaleDebtIds S ON DPD.Debt_Id = S.Debt_Id;
+
+	-- Xoa Debt records sai
+	DELETE D
+	FROM [OCS].[dbo].[Debt] D
+	JOIN @StaleDebtIds S ON D.Debt_Id = S.Debt_Id;
+
+	-- =========================================================
+	-- STEP 2: Re-insert cac Debt con thieu (PD co Priznak <> 5
+	--   nhung chua co Debt record tuong ung)
+	--   - Copy y chang logic tu usp_DailyClosingSaveAll
+	-- =========================================================
+	INSERT INTO [OCS].[dbo].[Debt] (Income_Date, ICO, NadrazenaFirma, Amount_Total_Income, Amount_Total_Debt, Status, Payment_Status)
+	SELECT MD.Income_Date, MD.FirstICO, MD.NadrazenaFirma, 0, MD.MissingAmount, 0, N'Zaplaceno'
+	FROM (
+		SELECT
+			@Closing_Date AS Income_Date,
+			MIN(PD.IC)    AS FirstICO,
+			SKU_Kod.Nazev AS NadrazenaFirma,
+			SUM(PD.SumaCelkem) AS MissingAmount
+		FROM [S5_Agenda_001_20190131130454].[dbo].[Finance_PokladniDoklad] PD WITH (NOLOCK)
+		OUTER APPLY (
+			SELECT TOP 1 AK.Nazev
+			FROM [S5_Agenda_001_20190131130454].[dbo].[Adresar_Firma] F WITH (NOLOCK)
+			JOIN [S5_Agenda_001_20190131130454].[dbo].[Adresar_FirmaAdresniKlic] FAK WITH (NOLOCK)
+				ON F.ID = FAK.Parent_ID AND FAK.Deleted = 0
+			JOIN [S5_Agenda_001_20190131130454].[dbo].[Adresar_AdresniKlic] AK WITH (NOLOCK)
+				ON FAK.AdresniKlic_ID = AK.ID AND AK.Deleted = 0
+			WHERE F.ICO = PD.IC AND F.Deleted = 0 AND AK.Kod LIKE N'SKU-%'
+			ORDER BY AK.Nazev ASC
+		) SKU_Kod
+		CROSS APPLY (
+			SELECT TOP (1) FV.DatumVystaveni
+			FROM [S5_Agenda_001_20190131130454].[dbo].[Saldo_Uhrada] U WITH (NOLOCK)
+			JOIN [S5_Agenda_001_20190131130454].[dbo].[Fakturace_FakturaVydana] FV WITH (NOLOCK)
+				ON U.ZdrojovyDoklad_ID = FV.ID AND FV.Deleted = 0
+			WHERE U.CilovyDoklad_ID = PD.ID AND U.Deleted = 0
+			ORDER BY FV.DatumVystaveni DESC
+		) M
+		WHERE PD.TypDokladu = 1
+		  AND PD.Deleted = 0
+		  AND PD.System_Priznak <> 5
+		  AND PD.DatumPlatby > M.DatumVystaveni
+		  AND CONVERT(DATE, PD.DatumPlatby) = @Closing_Date
+		GROUP BY SKU_Kod.Nazev
+		HAVING (
+			SKU_Kod.Nazev IS NOT NULL
+			AND NOT EXISTS (
+				SELECT 1 FROM [OCS].[dbo].[Debt] D WITH (NOLOCK)
+				WHERE D.NadrazenaFirma = SKU_Kod.Nazev AND D.Status = 0
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM [OCS].[dbo].[Incomes] I WITH (NOLOCK)
+				WHERE I.NadrazenaFirma = SKU_Kod.Nazev AND I.Income_Date = @Closing_Date AND I.Type = N'Dluh'
+			)
+		)
+		OR (
+			SKU_Kod.Nazev IS NULL
+			AND NOT EXISTS (
+				SELECT 1 FROM [OCS].[dbo].[Debt] D WITH (NOLOCK)
+				WHERE D.ICO = MIN(PD.IC) AND D.Status = 0 AND D.NadrazenaFirma IS NULL
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM [OCS].[dbo].[Incomes] I WITH (NOLOCK)
+				WHERE I.ICO = MIN(PD.IC) AND I.Income_Date = @Closing_Date AND I.NadrazenaFirma IS NULL AND I.Type = N'Dluh'
+			)
+		)
+	) MD;
+
+	-- =========================================================
+	-- STEP 2B: Rebuild lai toan bo DebtPaymentDetails cho ngay chot so
+	--   de dam bao cac PD moi duoc them vao sau khi recalculate van duoc phan anh
+	-- =========================================================
+	DELETE DPD
+	FROM [OCS].[dbo].[DebtPaymentDetails] DPD
+	JOIN [OCS].[dbo].[Debt] D ON DPD.Debt_Id = D.Debt_Id
+	WHERE D.Income_Date = @Closing_Date
+	  AND D.Payment_Status = N'Zaplaceno';
+
+	INSERT INTO [OCS].[dbo].[DebtPaymentDetails]
+		(Debt_Id, ICO, NadrazenaFirma, CisloDokladu, Payment_Date, Amount_Paid, Invoice_Date, Invoice_Amount, AdresaNazev, Vystavil, Snapshot_Date, Payment_Status)
+	SELECT
+		D.Debt_Id,
+		PD.IC AS ICO,
+		D.NadrazenaFirma,
+		PD.CisloDokladu,
+		PD.DatumPlatby AS Payment_Date,
+		PD.SumaCelkem AS Amount_Paid,
+		M.DatumVystaveni AS Invoice_Date,
+		0 AS Invoice_Amount,
+		ISNULL(PD.AdresaNazev, N'') AS AdresaNazev,
+		ISNULL(PD.Vystavil, N'') AS Vystavil,
+		@Closing_Date AS Snapshot_Date,
+		N'Zaplaceno' AS Payment_Status
+	FROM [OCS].[dbo].[Debt] D WITH (NOLOCK)
+	JOIN [S5_Agenda_001_20190131130454].[dbo].[Finance_PokladniDoklad] PD WITH (NOLOCK)
+		ON (
+			PD.IC = D.ICO
+			OR (
+				D.NadrazenaFirma IS NOT NULL
+				AND EXISTS (
+					SELECT 1
+					FROM [S5_Agenda_001_20190131130454].[dbo].[Adresar_Firma] F WITH (NOLOCK)
+					JOIN [S5_Agenda_001_20190131130454].[dbo].[Adresar_FirmaAdresniKlic] FAK WITH (NOLOCK)
+						ON F.ID = FAK.Parent_ID AND FAK.Deleted = 0
+					JOIN [S5_Agenda_001_20190131130454].[dbo].[Adresar_AdresniKlic] AK WITH (NOLOCK)
+						ON FAK.AdresniKlic_ID = AK.ID AND AK.Deleted = 0
+					WHERE F.ICO = PD.IC AND F.Deleted = 0 AND AK.Nazev = D.NadrazenaFirma AND AK.Kod LIKE N'SKU-%'
+				)
+			)
+		)
+	OUTER APPLY (
+		SELECT TOP 1 AK.Nazev
+		FROM [S5_Agenda_001_20190131130454].[dbo].[Adresar_Firma] F WITH (NOLOCK)
+		JOIN [S5_Agenda_001_20190131130454].[dbo].[Adresar_FirmaAdresniKlic] FAK WITH (NOLOCK)
+			ON F.ID = FAK.Parent_ID AND FAK.Deleted = 0
+		JOIN [S5_Agenda_001_20190131130454].[dbo].[Adresar_AdresniKlic] AK WITH (NOLOCK)
+			ON FAK.AdresniKlic_ID = AK.ID AND AK.Deleted = 0
+		WHERE F.ICO = PD.IC AND F.Deleted = 0 AND AK.Kod LIKE N'SKU-%'
+		ORDER BY AK.Nazev ASC
+	) SKU_Kod
+	CROSS APPLY (
+		SELECT TOP (1) FV.DatumVystaveni
+		FROM [S5_Agenda_001_20190131130454].[dbo].[Saldo_Uhrada] U WITH (NOLOCK)
+		JOIN [S5_Agenda_001_20190131130454].[dbo].[Fakturace_FakturaVydana] FV WITH (NOLOCK)
+			ON U.ZdrojovyDoklad_ID = FV.ID AND FV.Deleted = 0
+		WHERE U.CilovyDoklad_ID = PD.ID AND U.Deleted = 0
+		ORDER BY FV.DatumVystaveni DESC
+	) M
+	WHERE D.Income_Date = @Closing_Date
+	  AND D.Payment_Status = N'Zaplaceno'
+	  AND PD.TypDokladu = 1
+	  AND PD.Deleted = 0
+	  AND PD.System_Priznak <> 5
+	  AND PD.DatumPlatby > M.DatumVystaveni
+	  AND CONVERT(DATE, PD.DatumPlatby) = @Closing_Date
+	  AND (
+			(D.NadrazenaFirma IS NOT NULL AND SKU_Kod.Nazev = D.NadrazenaFirma)
+			OR (D.NadrazenaFirma IS NULL AND SKU_Kod.Nazev IS NULL AND PD.IC = D.ICO)
+	  );
+
+	DECLARE @AffectedDebts TABLE (Debt_Id BIGINT PRIMARY KEY);
+	INSERT INTO @AffectedDebts (Debt_Id)
+	SELECT DISTINCT Debt_Id
+	FROM [OCS].[dbo].[DebtPaymentDetails]
+	WHERE Snapshot_Date = @Closing_Date
+	  AND Payment_Status = N'Zaplaceno';
+
+	UPDATE D
+	SET D.Amount_Total_Debt = ISNULL(X.TotalPaid, 0)
+	FROM [OCS].[dbo].[Debt] D
+	JOIN @AffectedDebts A ON A.Debt_Id = D.Debt_Id
+	OUTER APPLY (
+		SELECT SUM(DPD.Amount_Paid) AS TotalPaid
+		FROM [OCS].[dbo].[DebtPaymentDetails] DPD WITH (NOLOCK)
+		WHERE DPD.Debt_Id = D.Debt_Id
+	) X;
+
+	UPDATE D
+	SET D.Status = 1
+	FROM [OCS].[dbo].[Debt] D
+	JOIN @AffectedDebts A ON A.Debt_Id = D.Debt_Id
+	WHERE D.Income_Date = @Closing_Date
+	  AND D.Status = 0
+	  AND D.Payment_Status = N'Zaplaceno'
+	  AND ISNULL(D.Amount_Total_Income, 0) = ISNULL(D.Amount_Total_Debt, 0);
+
+	-- =========================================================
+	-- STEP 3: Cap nhat lai DailyClosingControl cho ngay do
+	-- =========================================================
+	EXEC [dbo].[usp_PopulateDailyClosingControl]
+		@From = @Closing_Date,
+		@To   = @Closing_Date;
+
+END;
+GO
