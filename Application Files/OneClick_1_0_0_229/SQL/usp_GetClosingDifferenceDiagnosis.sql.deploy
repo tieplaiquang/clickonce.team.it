@@ -1,0 +1,312 @@
+-- ============================================================
+-- Stored Procedure: usp_GetClosingDifferenceDiagnosis
+-- Database:         OCS
+-- Description:      Diagnostika rozdílu pro daný den uzávěrky.
+--                   Vrací 3 result sety:
+--                     1) Souhrnný header (Tržba, Uzávěrka, Albacon, Celkem, Rozdíl)
+--                     2) Seznam dokladů (FakturaVydaná + DodacíListVydaný)
+--                     3) Příjmy (Dluh + Záloha) s vazbou na Debt/Deposit
+--
+-- FIX (multi-run days):
+--   Při více uzávěrkách v jednom dni (Closing_Run > 1) musí:
+--     - DailyClosingCashRaw = SUM Cash všech runs (ne jen posledního)
+--     - Balance adjustment  = PrevDay.Balance - FirstRun.Balance  (ne LastRun)
+--
+-- FIX (BlueIncome):
+--   DailyClosingTotalCash = DailyClosingCashRaw + Albacon - BlueIncomeTotal (Modrá)
+--   Shodné s výpočtem v fn_GetRevenueClosing
+-- ============================================================
+
+IF OBJECT_ID('dbo.usp_GetClosingDifferenceDiagnosis', 'P') IS NOT NULL
+	DROP PROCEDURE [dbo].[usp_GetClosingDifferenceDiagnosis];
+GO
+
+CREATE PROCEDURE [dbo].[usp_GetClosingDifferenceDiagnosis]
+	@Closing_Date DATE
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	IF @Closing_Date IS NULL
+	BEGIN
+		RAISERROR('Closing_Date is required.', 16, 1);
+		RETURN 510;
+	END;
+
+	-- ===========================================================
+	-- Result set 1: Souhrnný header
+	-- ===========================================================
+	;WITH Rev AS (
+		SELECT TOP (1) *
+		FROM dbo.fn_GetRevenueClosing(@Closing_Date, @Closing_Date) RC
+		WHERE RC.[Date] = @Closing_Date
+	),
+	LastClosing AS (
+		-- Metadata (Albacon, Closing_Id, Closing_Run atd.) z posledního runu
+		SELECT TOP (1) DC.*
+		FROM [OCS].[dbo].[DailyClosing] DC WITH (NOLOCK)
+		WHERE DC.Closing_Date = @Closing_Date
+		ORDER BY DC.Closing_Run DESC
+	)
+	SELECT
+		@Closing_Date                                                                       AS Closing_Date,
+		ISNULL(R.RevenueTotalCash, 0)                                                       AS RevenueTotalCash,
+		ISNULL(ROUND(ISNULL(DCash.DailyClosingCashRawCalc, 0), 2), 0)                      AS DailyClosingCashRaw,
+		ISNULL(LC.Albacon, 0)                                                               AS Albacon,
+		ISNULL(ROUND(ISNULL(DTotal.DailyClosingTotalCalc, 0), 2), 0)                        AS DailyClosingTotalCash,
+		ISNULL(ROUND(ISNULL(DTotal.DailyClosingTotalCalc, 0) - ISNULL(R.RevenueTotalCash, 0), 2), 0) AS DifferenceCash,
+		LC.Closing_Id,
+		LC.Closing_Run,
+		LC.Created_By   AS Closed_By,
+		LC.Closing_Time
+	FROM Rev R
+	FULL OUTER JOIN LastClosing LC ON 1 = 1
+
+	OUTER APPLY (
+		-- Balance prvního runu daného dne (carry-over základ)
+		-- Použití ASC zajišťuje správný výpočet i při více runech
+		SELECT TOP 1 LR.Balance
+		FROM [OCS].[dbo].[DailyClosing] LR WITH (NOLOCK)
+		WHERE LR.Closing_Date = @Closing_Date
+		ORDER BY LR.Closing_Run ASC
+	) FirstRun
+
+	OUTER APPLY (
+		-- První run předchozího dne (ASC = FirstRun, shodné s fn_GetRevenueClosing)
+		SELECT TOP 1 Prev.Is_Manual_Balance, Prev.Balance
+		FROM [OCS].[dbo].[DailyClosing] Prev WITH (NOLOCK)
+		WHERE Prev.Closing_Date < @Closing_Date
+		ORDER BY Prev.Closing_Date DESC, Prev.Closing_Run ASC
+	) PrevDC
+
+	CROSS APPLY (
+		-- Cash raw = SUM všech runů daného dne + carry-over korekce
+		-- (FirstRun.Balance = balance na začátku dne, bez nových nábojů z dalších runů)
+		SELECT CAST(ROUND(
+			ISNULL((
+				SELECT
+					SUM(
+						ISNULL(DC.Cash_CZK, 0) +
+						ISNULL(DC.Coins,    0) +
+						CASE WHEN ISNULL(DC.Cash_EUR, 0) > 0 AND ISNULL(DC.Rate_EUR, 0) > 0
+							 THEN DC.Cash_EUR * DC.Rate_EUR ELSE 0 END +
+						CASE WHEN ISNULL(DC.Cash_USD, 0) > 0 AND ISNULL(DC.Rate_USD, 0) > 0
+							 THEN DC.Cash_USD * DC.Rate_USD ELSE 0 END
+					)
+				FROM [OCS].[dbo].[DailyClosing] DC WITH (NOLOCK)
+				WHERE DC.Closing_Date = @Closing_Date
+			), 0)
+			+ CASE
+				WHEN LC.Is_Manual_Balance = 1
+					THEN 0
+				WHEN ISNULL(PrevDC.Is_Manual_Balance, 0) = 1
+					THEN -ISNULL(FirstRun.Balance, 0)
+				ELSE
+					ISNULL(PrevDC.Balance, 0) - ISNULL(FirstRun.Balance, 0)
+			  END
+		, 2) AS DECIMAL(18,2)) AS DailyClosingCashRawCalc
+	) DCash
+
+	OUTER APPLY (
+		-- Příjmy typu 'Modrá' pro daný den (odečítají se z uzávěrkové hotovosti)
+		SELECT ISNULL(SUM(I.Amount_Total_CZK), 0) AS BlueIncomeTotal
+		FROM [OCS].[dbo].[Incomes] I WITH (NOLOCK)
+		WHERE I.[Type] = N'Modrá'
+		  AND I.Income_Date = @Closing_Date
+	) BlueIncome
+
+	CROSS APPLY (
+		SELECT (
+			ISNULL(DCash.DailyClosingCashRawCalc, 0)
+			+ ISNULL(LC.Albacon, 0)
+			- ISNULL(BlueIncome.BlueIncomeTotal, 0)
+		) AS DailyClosingTotalCalc
+	) DTotal;
+
+	-- ===========================================================
+	-- Result set 2: Doklady (FakturaVydaná + DodacíListVydaný)
+	-- ===========================================================
+	;WITH Faktury AS (
+		SELECT
+			'FV'              AS SourceType,
+			FV.ID             AS Source_Id,
+			FV.CisloDokladu,
+			FV.DatumVystaveni AS [Date],
+			CASE WHEN FV.ZapornyPohyb = 0 THEN U.CastkaHrazenaDM ELSE -U.CastkaHrazenaDM END AS Amount,
+			'Faktura'         AS SourceDescription,
+			NULL              AS IC_ORIGIN,
+			FV.AdresaNazev    AS Firma
+		FROM [S5_Agenda_001_20190131130454].[dbo].[Fakturace_FakturaVydana] FV WITH (NOLOCK)
+		JOIN [S5_Agenda_001_20190131130454].[dbo].[Ciselniky_ZpusobPlatby] Z WITH (NOLOCK)
+			ON Z.ID = FV.ZpusobPlatby_ID AND Z.Deleted = 0 AND Z.Nazev = N'Hotove'
+		JOIN [S5_Agenda_001_20190131130454].[dbo].[Saldo_Uhrada] U WITH (NOLOCK)
+			ON U.ZdrojovyDoklad_ID = FV.ID AND U.CilDruhDokladu = N'Pokladní doklad' AND U.Deleted = 0
+		WHERE FV.Deleted = 0
+		  AND FV.System_Priznak != 5
+		  AND FV.DatumVystaveni = @Closing_Date
+	),
+	DLV AS (
+		SELECT
+			'DLV'             AS SourceType,
+			DV.ID             AS Source_Id,
+			DV.CisloDokladu,
+			DV.DatumVystaveni AS [Date],
+			CASE WHEN DV.ZapornyPohyb = 0 THEN DV.SumaCelkem ELSE -DV.SumaCelkem END AS Amount,
+			'DodaciListVydany' AS SourceDescription,
+			NULL               AS IC_ORIGIN,
+			DV.AdresaNazev     AS Firma
+		FROM [S5_Agenda_001_20190131130454].[dbo].[SkladovyDoklad_DodaciListVydany] DV WITH (NOLOCK)
+		WHERE DV.Deleted = 0
+		  AND DV.System_Priznak = 1
+		  AND DV.DatumVystaveni = @Closing_Date
+	),
+	AllSources AS (
+		SELECT * FROM Faktury
+		UNION ALL
+		SELECT * FROM DLV
+	)
+	SELECT
+		S.SourceType,
+		S.Source_Id,
+		S.CisloDokladu,
+		S.[Date],
+		S.Amount,
+		S.SourceDescription,
+		CASE
+			WHEN EXISTS (
+				SELECT 1
+				FROM [OCS].[dbo].[DebtPaymentDetails] DPD WITH (NOLOCK)
+				WHERE DPD.CisloDokladu = S.CisloDokladu
+				  AND DPD.Payment_Date = @Closing_Date
+			)
+			OR EXISTS (
+				SELECT 1
+				FROM [OCS].[dbo].[DepositPaymentDetails] RPD WITH (NOLOCK)
+				WHERE RPD.CisloDokladu = S.CisloDokladu
+				  AND RPD.Payment_Date = @Closing_Date
+			)
+			THEN 1 ELSE 0
+		END AS MatchedPaymentByDoc,
+		CASE
+			WHEN EXISTS (
+				SELECT 1
+				FROM [OCS].[dbo].[Incomes] I WITH (NOLOCK)
+				WHERE I.Income_Date = @Closing_Date
+				  AND I.[Type] IN (N'Dluh', N'Záloha')
+				  AND (
+					  I.DocumentNumber = S.CisloDokladu
+				   OR EXISTS (
+						  SELECT 1
+						  FROM [OCS].[dbo].[DebtPaymentDetails] DPD2 WITH (NOLOCK)
+						  WHERE DPD2.Debt_Id IN (
+							  SELECT D2.Debt_Id
+							  FROM [OCS].[dbo].[Debt] D2 WITH (NOLOCK)
+							  WHERE D2.DocumentNumber = S.CisloDokladu AND D2.Status = 0
+						  )
+						  AND DPD2.Payment_Date = @Closing_Date
+					  )
+				  )
+			)
+			THEN 1 ELSE 0
+		END AS MatchedIncomeOnDate,
+		S.Firma
+	FROM AllSources S
+	ORDER BY S.SourceType, S.Amount DESC;
+
+	-- ===========================================================
+	-- Result set 3: Příjmy (Dluh + Záloha) s vazbou na Debt/Deposit
+	-- ===========================================================
+	;WITH IncomesForDate AS (
+		SELECT I.*
+		FROM [OCS].[dbo].[Incomes] I WITH (NOLOCK)
+		WHERE I.Income_Date = @Closing_Date
+		  AND I.[Type] IN (N'Dluh', N'Záloha')
+	),
+	LinkDebt AS (
+		SELECT
+			I.Income_Id,
+			I.DocumentNumber,
+			I.ICO,
+			I.NadrazenaFirma,
+			D.Debt_Id,
+			D.Amount_Total_Income AS Debt_Amount_Total_Income,
+			D.Amount_Total_Debt   AS Debt_Amount_Total_Debt,
+			ISNULL((
+				SELECT SUM(PD.Amount_Paid)
+				FROM [OCS].[dbo].[DebtPaymentDetails] PD WITH (NOLOCK)
+				WHERE PD.Debt_Id = D.Debt_Id
+				  AND PD.Payment_Date = @Closing_Date
+			), 0) AS SumPaymentsOnClosingDate
+		FROM IncomesForDate I
+		LEFT JOIN [OCS].[dbo].[Debt] D WITH (NOLOCK)
+			ON D.Status = 0
+			AND (
+				(I.DocumentNumber IS NOT NULL AND D.DocumentNumber = I.DocumentNumber)
+			 OR (I.DocumentNumber IS NULL AND (
+					(I.NadrazenaFirma IS NOT NULL AND D.NadrazenaFirma = I.NadrazenaFirma)
+				 OR (I.NadrazenaFirma IS NULL AND D.NadrazenaFirma IS NULL AND D.ICO = I.ICO)
+			 ))
+			)
+		WHERE I.[Type] = N'Dluh'
+	),
+	LinkDeposit AS (
+		SELECT
+			I.Income_Id,
+			I.DocumentNumber,
+			I.ICO,
+			I.NadrazenaFirma,
+			DP.Deposit_Id,
+			DP.Amount_Total_Income  AS Deposit_Amount_Total_Income,
+			DP.Amount_Total_Deposit AS Deposit_Amount_Total_Deposit,
+			ISNULL((
+				SELECT SUM(PD.Amount_Paid)
+				FROM [OCS].[dbo].[DepositPaymentDetails] PD WITH (NOLOCK)
+				WHERE PD.Deposit_Id = DP.Deposit_Id
+				  AND PD.Payment_Date = @Closing_Date
+			), 0) AS SumPaymentsOnClosingDate
+		FROM IncomesForDate I
+		LEFT JOIN [OCS].[dbo].[Deposit] DP WITH (NOLOCK)
+			ON DP.Status = 0
+			AND (
+				(I.DocumentNumber IS NOT NULL AND DP.DocumentNumber = I.DocumentNumber)
+			 OR (I.DocumentNumber IS NULL AND (
+					(I.NadrazenaFirma IS NOT NULL AND DP.NadrazenaFirma = I.NadrazenaFirma)
+				 OR (I.NadrazenaFirma IS NULL AND DP.NadrazenaFirma IS NULL AND DP.ICO = I.ICO)
+			 ))
+			)
+		WHERE I.[Type] = N'Záloha'
+	)
+	SELECT
+		'Dluh'          AS Income_Type,
+		L.Income_Id,
+		L.DocumentNumber,
+		L.ICO,
+		L.NadrazenaFirma,
+		L.Debt_Id       AS Linked_Debt_Id,
+		L.Debt_Amount_Total_Income,
+		L.Debt_Amount_Total_Debt,
+		L.SumPaymentsOnClosingDate,
+		CASE WHEN ISNULL(L.Debt_Amount_Total_Income, 0) - ISNULL(L.SumPaymentsOnClosingDate, 0) <> 0 THEN 1 ELSE 0 END AS NeedsAction,
+		CASE WHEN ISNULL(L.SumPaymentsOnClosingDate, 0) > 0 THEN 1 ELSE 0 END AS HasPaymentOnClosingDate
+	FROM LinkDebt L
+
+	UNION ALL
+
+	SELECT
+		'Záloha'        AS Income_Type,
+		L.Income_Id,
+		L.DocumentNumber,
+		L.ICO,
+		L.NadrazenaFirma,
+		L.Deposit_Id    AS Linked_Deposit_Id,
+		L.Deposit_Amount_Total_Income,
+		L.Deposit_Amount_Total_Deposit,
+		L.SumPaymentsOnClosingDate,
+		CASE WHEN ISNULL(L.Deposit_Amount_Total_Income, 0) - ISNULL(L.SumPaymentsOnClosingDate, 0) <> 0 THEN 1 ELSE 0 END AS NeedsAction,
+		CASE WHEN ISNULL(L.SumPaymentsOnClosingDate, 0) > 0 THEN 1 ELSE 0 END AS HasPaymentOnClosingDate
+	FROM LinkDeposit L
+
+	ORDER BY Income_Type, NeedsAction DESC, Income_Id;
+
+END;
+GO

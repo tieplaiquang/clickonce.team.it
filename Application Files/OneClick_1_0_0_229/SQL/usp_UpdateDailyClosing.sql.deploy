@@ -1,0 +1,200 @@
+IF EXISTS (SELECT 1 FROM sys.procedures WHERE name = 'usp_UpdateDailyClosing')
+	DROP PROCEDURE [dbo].[usp_UpdateDailyClosing];
+GO
+
+CREATE PROCEDURE [dbo].[usp_UpdateDailyClosing]
+	@Closing_Id         BIGINT,
+	@Cash_CZK           DECIMAL(18,2),
+	@Cash_EUR           DECIMAL(18,2),
+	@Cash_USD           DECIMAL(18,2),
+	@Rate_EUR           DECIMAL(18,6) = NULL,
+	@Rate_USD           DECIMAL(18,6) = NULL,
+	@Coins              DECIMAL(18,2),
+	@Note               NVARCHAR(500) = NULL,
+	@Manual_Balance_CZK DECIMAL(18,2) = NULL,
+	@Updated_By         NVARCHAR(200) = NULL
+AS
+BEGIN
+	SET NOCOUNT ON;
+	SET XACT_ABORT ON;
+
+	DECLARE @Closing_Date        DATE;
+	DECLARE @Closing_Run         INT;
+	DECLARE @Current_Balance     DECIMAL(18,2);
+	DECLARE @Current_Balance_EUR DECIMAL(18,2);
+	DECLARE @Current_Balance_USD DECIMAL(18,2);
+	DECLARE @IsManualBalance     BIT = 0;
+
+	SELECT
+		@Closing_Date        = dc.Closing_Date,
+		@Closing_Run         = dc.Closing_Run,
+		@Current_Balance     = dc.Balance,
+		@Current_Balance_EUR = dc.Balance_EUR,
+		@Current_Balance_USD = dc.Balance_USD
+	FROM [dbo].[DailyClosing] dc
+	WHERE dc.Closing_Id = @Closing_Id;
+
+	IF @Closing_Date IS NULL
+		RAISERROR(N'Uzaverka s Id=%I64d nebyla nalezena.', 16, 1, @Closing_Id);
+
+	IF @Manual_Balance_CZK IS NOT NULL
+	BEGIN
+		IF @Manual_Balance_CZK < 0
+			RAISERROR(N'Manual Balance CZK nemuze byt zaporny.', 16, 1);
+		SET @Current_Balance = @Manual_Balance_CZK;
+		SET @IsManualBalance = 1;
+	END
+
+	DECLARE @Albacon_Value DECIMAL(18,2) = 0;
+	EXEC [dbo].[usp_GetAlbacon] @Closing_Date = @Closing_Date, @Albacon_Value = @Albacon_Value OUTPUT;
+
+	BEGIN TRANSACTION;
+
+	-- Update the edited row
+	UPDATE [dbo].[DailyClosing]
+	SET
+		Cash_CZK          = @Cash_CZK,
+		Cash_EUR          = @Cash_EUR,
+		Cash_USD          = @Cash_USD,
+		Rate_EUR          = @Rate_EUR,
+		Rate_USD          = @Rate_USD,
+		Coins             = @Coins,
+		Note              = NULLIF(LTRIM(RTRIM(@Note)), N''),
+		Albacon           = @Albacon_Value,
+		Is_Manual_Balance = @IsManualBalance,
+		Balance           = @Current_Balance,
+		Remaining         = ROUND(@Cash_CZK + @Coins + @Current_Balance, 2),
+		Remaining_EUR     = ROUND(@Current_Balance_EUR + @Cash_EUR, 2),
+		Remaining_USD     = ROUND(@Current_Balance_USD + @Cash_USD, 2)
+	WHERE Closing_Id = @Closing_Id;
+
+	-- ----------------------------------------------------------------
+	-- Propagate Balance / Remaining to all subsequent runs and dates.
+	-- Each row's Balance = Remaining of the previous row (chain order).
+	-- ----------------------------------------------------------------
+	DECLARE @PropClosingId     BIGINT;
+	DECLARE @PropDate          DATE;
+	DECLARE @PropRun           INT;
+	DECLARE @PropCashCZK       DECIMAL(18,2);
+	DECLARE @PropCashEUR       DECIMAL(18,2);
+	DECLARE @PropCashUSD       DECIMAL(18,2);
+	DECLARE @PropCoins         DECIMAL(18,2);
+	DECLARE @PropIsManual      BIT;
+	DECLARE @PrevRemaining     DECIMAL(18,2);
+	DECLARE @PrevRemainingEUR  DECIMAL(18,2);
+	DECLARE @PrevRemainingUSD  DECIMAL(18,2);
+	DECLARE @PrevPropDate      DATE;
+	DECLARE @NewBalance        DECIMAL(18,2);
+	DECLARE @NewBalanceEUR     DECIMAL(18,2);
+	DECLARE @NewBalanceUSD     DECIMAL(18,2);
+	DECLARE @VaultCZK          DECIMAL(18,2);
+	DECLARE @VaultEUR          DECIMAL(18,2);
+	DECLARE @VaultUSD          DECIMAL(18,2);
+
+	-- Seed from the just-updated row
+	SELECT
+		@PrevRemaining    = Remaining,
+		@PrevRemainingEUR = Remaining_EUR,
+		@PrevRemainingUSD = Remaining_USD
+	FROM [dbo].[DailyClosing]
+	WHERE Closing_Id = @Closing_Id;
+
+	SET @PrevPropDate = @Closing_Date;
+
+	DECLARE PropCursor CURSOR LOCAL FAST_FORWARD FOR
+		SELECT
+			Closing_Id,
+			Closing_Date,
+			Closing_Run,
+			Cash_CZK,
+			Cash_EUR,
+			Cash_USD,
+			Coins,
+			Is_Manual_Balance
+		FROM [dbo].[DailyClosing]
+		WHERE
+			(Closing_Date = @Closing_Date AND Closing_Run > @Closing_Run)
+			OR Closing_Date > @Closing_Date
+		ORDER BY Closing_Date ASC, Closing_Run ASC;
+
+	OPEN PropCursor;
+	FETCH NEXT FROM PropCursor INTO
+		@PropClosingId, @PropDate, @PropRun,
+		@PropCashCZK, @PropCashEUR, @PropCashUSD,
+		@PropCoins, @PropIsManual;
+
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		-- When crossing to a new date, deduct vault transfers for the previous date
+		IF @PropDate > @PrevPropDate
+		BEGIN
+			SELECT
+				@VaultCZK = ISNULL(SUM(vt.Amount_CZK), 0),
+				@VaultEUR = ISNULL(SUM(vt.Amount_EUR), 0),
+				@VaultUSD = ISNULL(SUM(vt.Amount_USD), 0)
+			FROM [dbo].[VaultTransfer] vt
+			WHERE vt.Closing_Date = @PrevPropDate
+			  AND vt.Source    = N'Pokladna'
+			  AND vt.Direction = N'In';
+
+			IF @PropIsManual = 1
+				SET @NewBalance = (SELECT Balance FROM [dbo].[DailyClosing] WHERE Closing_Id = @PropClosingId);
+			ELSE
+				SET @NewBalance = @PrevRemaining - @VaultCZK;
+
+			SET @NewBalanceEUR = @PrevRemainingEUR - @VaultEUR;
+			SET @NewBalanceUSD = @PrevRemainingUSD - @VaultUSD;
+		END
+		ELSE
+		BEGIN
+			-- Same-day subsequent run: balance = remaining of previous run, no vault deduction
+			SET @NewBalance    = @PrevRemaining;
+			SET @NewBalanceEUR = @PrevRemainingEUR;
+			SET @NewBalanceUSD = @PrevRemainingUSD;
+		END
+
+		UPDATE [dbo].[DailyClosing]
+		SET
+			Balance       = @NewBalance,
+			Balance_EUR   = @NewBalanceEUR,
+			Balance_USD   = @NewBalanceUSD,
+			Remaining     = ROUND(@PropCashCZK + @PropCoins + @NewBalance, 2),
+			Remaining_EUR = ROUND(@NewBalanceEUR + @PropCashEUR, 2),
+			Remaining_USD = ROUND(@NewBalanceUSD + @PropCashUSD, 2)
+		WHERE Closing_Id = @PropClosingId;
+
+		-- Read back updated values to chain to the next row
+		SELECT
+			@PrevRemaining    = Remaining,
+			@PrevRemainingEUR = Remaining_EUR,
+			@PrevRemainingUSD = Remaining_USD
+		FROM [dbo].[DailyClosing]
+		WHERE Closing_Id = @PropClosingId;
+
+		SET @PrevPropDate = @PropDate;
+
+		FETCH NEXT FROM PropCursor INTO
+			@PropClosingId, @PropDate, @PropRun,
+			@PropCashCZK, @PropCashEUR, @PropCashUSD,
+			@PropCoins, @PropIsManual;
+	END
+
+	CLOSE PropCursor;
+	DEALLOCATE PropCursor;
+
+	COMMIT;
+
+	BEGIN TRY
+		EXEC [dbo].[usp_PopulateDailyClosingControl]
+			@From = @Closing_Date,
+			@To   = @Closing_Date;
+	END TRY
+	BEGIN CATCH
+		DECLARE @errMsg NVARCHAR(4000) = ERROR_MESSAGE();
+		PRINT N'Warning: usp_PopulateDailyClosingControl failed for date ' + CONVERT(NVARCHAR(10), @Closing_Date) + N' - ' + ISNULL(@errMsg, N'');
+	END CATCH;
+
+	SELECT @Closing_Id AS Closing_Id, @Closing_Run AS Closing_Run;
+END;
+GO
+
