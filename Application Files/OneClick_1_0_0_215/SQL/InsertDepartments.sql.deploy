@@ -1,9 +1,0 @@
--- Insert 6 Departments with correct Czech characters
-INSERT INTO Departments (DepartmentId, DepartmentKey, DepartmentName, Description, IsActive)
-VALUES 
-    (NEWID(), N'sales', N'Sales', N'Oddělení prodejů', 1),
-    (NEWID(), N'it', N'IT', N'IT oddělení', 1),
-    (NEWID(), N'marketing', N'Marketing', N'Marketing', 1),
-    (NEWID(), N'nakup', N'Nákup', N'Nákupní oddělení', 1),
-    (NEWID(), N'prodejna', N'Prodejna', N'Prodejní prodejna', 1),
-    (NEWID(), N'sklad', N'Sklad', N'Skladovací oddělení', 1);
